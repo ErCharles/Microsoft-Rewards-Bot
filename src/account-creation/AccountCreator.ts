@@ -894,6 +894,11 @@ export class AccountCreator {
 
       await this.page.goto(this.referralUrl, { waitUntil: 'networkidle', timeout: 60000 })
 
+      // CRITICAL: Handle cookies immediately after navigation
+      // Rejecting cookies often clears ALL popups (including "Get Started")
+      // We must refresh the page after rejection to restore the UI state
+      await this.handleCookies()
+
       await this.waitForPageStable('REFERRAL_PAGE', 10000)
       await this.humanDelay(1000, 2000)
 
@@ -905,45 +910,64 @@ export class AccountCreator {
       ]
 
       let clickSuccess = false
-      for (const selector of joinButtonSelectors) {
-        const button = this.page.locator(selector).first()
-        const visible = await button.isVisible().catch(() => false)
 
-        if (visible) {
-          const urlBefore = this.page.url()
+      // RETRY LOGIC: Try to find the button, if not found, reload and try again
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        log(false, 'CREATOR', `🔍 Searching for "Join" button (Attempt ${attempt}/2)...`, 'log', 'cyan')
 
-          await button.click()
-          // OPTIMIZED: Reduced delay after Join click
-          await this.humanDelay(1000, 1500)
+        let buttonFound = false
+        for (const selector of joinButtonSelectors) {
+          const button = this.page.locator(selector).first()
+          const visible = await button.isVisible().catch(() => false)
 
-          // CRITICAL: Verify the click actually did something
-          const urlAfter = this.page.url()
+          if (visible) {
+            buttonFound = true
+            log(false, 'CREATOR', `✅ Found "Join" button: ${selector}`, 'log', 'green')
+            const urlBefore = this.page.url()
 
-          if (urlAfter !== urlBefore || urlAfter.includes('login.live.com') || urlAfter.includes('signup')) {
-            // OPTIMIZED: Reduced from 8000ms to 3000ms
-            await this.waitForPageStable('AFTER_JOIN_CLICK', 3000)
-            clickSuccess = true
-            break
-          } else {
-            // OPTIMIZED: Reduced retry delay
-            await this.humanDelay(1000, 1500)
-            // Try clicking again
             await button.click()
+            // OPTIMIZED: Reduced delay after Join click
             await this.humanDelay(1000, 1500)
 
-            const urlRetry = this.page.url()
-            if (urlRetry !== urlBefore) {
+            // CRITICAL: Verify the click actually did something
+            const urlAfter = this.page.url()
+
+            if (urlAfter !== urlBefore || urlAfter.includes('login.live.com') || urlAfter.includes('signup')) {
               // OPTIMIZED: Reduced from 8000ms to 3000ms
               await this.waitForPageStable('AFTER_JOIN_CLICK', 3000)
               clickSuccess = true
               break
+            } else {
+              // OPTIMIZED: Reduced retry delay
+              await this.humanDelay(1000, 1500)
+              // Try clicking again
+              await button.click()
+              await this.humanDelay(1000, 1500)
+
+              const urlRetry = this.page.url()
+              if (urlRetry !== urlBefore) {
+                // OPTIMIZED: Reduced from 8000ms to 3000ms
+                await this.waitForPageStable('AFTER_JOIN_CLICK', 3000)
+                clickSuccess = true
+                break
+              }
             }
           }
+        }
+
+        if (clickSuccess) break
+
+        if (!buttonFound && attempt === 1) {
+          log(false, 'CREATOR', '⚠️ "Join" button not found. Reloading page to retry...', 'warn', 'yellow')
+          await this.page.reload({ waitUntil: 'networkidle' })
+          await this.waitForPageStable('RELOAD_RETRY', 5000)
+          await this.humanDelay(2000, 3000)
         }
       }
 
       if (!clickSuccess) {
         // Navigate directly to signup
+        log(false, 'CREATOR', '⚠️ Failed to find/click Join button. Navigating directly to login...', 'warn', 'yellow')
         await this.page.goto('https://login.live.com/', { waitUntil: 'networkidle', timeout: 30000 })
         // OPTIMIZED: Reduced from 8000ms to 3000ms
         await this.waitForPageStable('DIRECT_LOGIN', 3000)
@@ -952,9 +976,53 @@ export class AccountCreator {
       log(false, 'CREATOR', '🌐 Navigating to Microsoft login...', 'log', 'cyan')
       await this.page.goto('https://login.live.com/', { waitUntil: 'networkidle', timeout: 60000 })
 
+      // Handle cookies for direct login too
+      await this.handleCookies()
+
       // OPTIMIZED: Reduced from 20000ms to 5000ms
       await this.waitForPageStable('LOGIN_PAGE', 5000)
       await this.humanDelay(1000, 1500)
+    }
+  }
+
+  /**
+   * CRITICAL: Handle cookie banner by rejecting all
+   * Includes logic to refresh page if rejection clears necessary UI elements
+   */
+  private async handleCookies(): Promise<void> {
+    log(false, 'CREATOR', '🍪 Checking for cookie banner...', 'log', 'cyan')
+
+    try {
+      // Common cookie rejection selectors
+      const rejectSelectors = [
+        'button[id="onetrust-reject-all-handler"]',
+        'button[class*="reject"]',
+        'button[title="Reject"]',
+        'button:has-text("Reject all")',
+        'button:has-text("Refuser tout")',
+        'button:has-text("Refuser")'
+      ]
+
+      for (const selector of rejectSelectors) {
+        const button = this.page.locator(selector).first()
+        if (await button.isVisible().catch(() => false)) {
+          log(false, 'CREATOR', '✅ Rejecting cookies', 'log', 'green')
+          await button.click()
+          await this.humanDelay(1000, 2000)
+
+          // CRITICAL FIX: Refresh page after cookie rejection
+          // Rejecting cookies often removes the "Get Started" popup along with the banner
+          // Refreshing restores the page state with cookies rejected but UI intact
+          log(false, 'CREATOR', '🔄 Refreshing page to restore UI after cookie rejection...', 'log', 'cyan')
+          await this.page.reload({ waitUntil: 'networkidle' })
+          await this.waitForPageStable('COOKIE_REFRESH', 5000)
+          return
+        }
+      }
+
+      log(false, 'CREATOR', 'No cookie banner found (or already handled)', 'log', 'gray')
+    } catch (error) {
+      log(false, 'CREATOR', `Cookie handling warning: ${error}`, 'warn', 'yellow')
     }
   }
 
