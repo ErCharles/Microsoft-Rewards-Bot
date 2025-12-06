@@ -77,7 +77,22 @@ export default class BrowserFunc {
                 return
             }
 
-            await page.goto(this.bot.config.baseURL)
+            const navigate = async () => {
+                await page.goto(this.bot.config.baseURL, { waitUntil: 'domcontentloaded', timeout: 20000 })
+            }
+
+            try {
+                await navigate()
+            } catch (navErr) {
+                const msg = navErr instanceof Error ? navErr.message : String(navErr)
+                if (/ERR_ABORTED/i.test(msg)) {
+                    this.bot.log(this.bot.isMobile, 'GO-HOME', `Navigation aborted, retrying once: ${msg}`, 'warn')
+                    await this.bot.utils.wait(500)
+                    await navigate()
+                } else {
+                    throw navErr
+                }
+            }
 
             // IMPROVED: Smart page readiness check after navigation
             // FIXED: Use timeoutMs parameter with increased timeout for slower networks
