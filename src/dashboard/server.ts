@@ -21,7 +21,7 @@ export class DashboardServer {
   private server: ReturnType<typeof createServer>
   private wss: WebSocketServer
   private clients: Set<WebSocket> = new Set()
-  private heartbeatInterval?: NodeJS.Timer
+  private heartbeatInterval?: NodeJS.Timeout
   private dashboardLimiter = rateLimit({
     windowMs: 15 * 60 * 1000, // 15 minutes
     max: 100, // limit each IP to 100 requests per windowMs for dashboard UI

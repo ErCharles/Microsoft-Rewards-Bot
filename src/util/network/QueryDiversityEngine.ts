@@ -22,7 +22,7 @@ export class QueryDiversityEngine {
   private logger?: (source: string, message: string, level?: 'info' | 'warn' | 'error') => void
   private httpClient: HttpClient
 
-  constructor(config?: Partial<QueryDiversityConfig>, logger?: (source: string, message: string, level?: 'info' | 'warn' | 'error'), httpClient?: HttpClient) {
+  constructor(config?: Partial<QueryDiversityConfig>, logger?: (source: string, message: string, level?: 'info' | 'warn' | 'error') => void, httpClient?: HttpClient) {
     const maxQueriesPerSource = Math.max(1, Math.min(config?.maxQueriesPerSource || 10, 50))
     const cacheMinutes = Math.max(1, Math.min(config?.cacheMinutes || 30, 1440))
 

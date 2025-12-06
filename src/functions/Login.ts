@@ -964,6 +964,17 @@ export class Login {
         }
     }
 
+    private async clickFirstVisibleSelector(page: Page, selectors: readonly string[]): Promise<boolean> {
+        for (const sel of selectors) {
+            const loc = page.locator(sel).first()
+            if (await loc.isVisible().catch(() => false)) {
+                await loc.click().catch(logError('LOGIN', `Click failed for selector: ${sel}`, this.bot.isMobile))
+                return true
+            }
+        }
+        return false
+    }
+
     private async switchToPasswordLink(page: Page) {
         try {
             const passwordClicked = await this.tryClickPasswordOption(page)
