@@ -1,4 +1,5 @@
 import axios from 'axios'
+import crypto from 'crypto'
 import fs from 'fs'
 import path from 'path'
 import { DISCORD } from '../../constants'
@@ -17,27 +18,170 @@ interface ErrorReportPayload {
     }
 }
 
+const SANITIZE_PATTERNS: Array<[RegExp, string]> = [
+    [/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[EMAIL_REDACTED]'],
+    [/[A-Za-z]:\\(?:[^\\/:*?"<>|\r\n]+\\)*[^\\/:*?"<>|\r\n]*/g, '[PATH_REDACTED]'],
+    [/\/(?:home|Users)\/[^/\s]+(?:\/[^/\s]+)*/g, '[PATH_REDACTED]'],
+    [/\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b/g, '[IP_REDACTED]'],
+    [/\b[A-Za-z0-9_-]{20,}\b/g, '[TOKEN_REDACTED]']
+]
+
+function sanitizeSensitiveText(text: string): string {
+    return SANITIZE_PATTERNS.reduce((acc, [pattern, replace]) => acc.replace(pattern, replace), text)
+}
+
+/**
+ * Build the Discord payload from error and context (sanitizes content)
+ */
+function buildDiscordPayload(config: Config, error: Error | string, additionalContext?: Record<string, unknown>) {
+    const errorMessage = error instanceof Error ? error.message : String(error)
+    const sanitizedForLogging = sanitizeSensitiveText(errorMessage)
+
+    if (!shouldReportError(errorMessage)) {
+        process.stderr.write(`[ErrorReporting] Filtered error (expected/benign): ${sanitizedForLogging.substring(0, 100)}\n`)
+        return { username: 'Microsoft-Rewards-Bot Error Reporter', content: 'Filtered error (not reported)' }
+    }
+
+    const errorStack = error instanceof Error ? error.stack : undefined
+
+    const sanitizedMessage = sanitizeSensitiveText(errorMessage)
+    const sanitizedStack = errorStack ? sanitizeSensitiveText(errorStack).split('\n').slice(0, 10).join('\n') : undefined
+
+    const payloadContext: ErrorReportPayload['context'] = {
+        version: getProjectVersion(),
+        platform: process.platform,
+        arch: process.arch,
+        nodeVersion: process.version,
+        timestamp: new Date().toISOString(),
+        botMode: (additionalContext?.platform as string) || 'UNKNOWN'
+    }
+
+    if (additionalContext) {
+        for (const [key, value] of Object.entries(additionalContext)) {
+            if (typeof value === 'string') payloadContext[key as keyof typeof payloadContext] = sanitizeSensitiveText(value)
+            else payloadContext[key as keyof typeof payloadContext] = value as unknown
+        }
+    }
+
+    const osPlatform = (() => {
+        // Basic platform formatting
+        switch (payloadContext.platform) {
+            case 'win32': return '🪟 Windows'
+            case 'darwin': return '🍎 macOS'
+            case 'linux': return '🐧 Linux'
+            default: return payloadContext.platform
+        }
+    })()
+
+    const embed: unknown = {
+        title: '🐛 Automatic Error Report',
+        description: `\`\`\`js\n${sanitizedMessage.slice(0, 700)}\n\`\`\``,
+        color: DISCORD.COLOR_RED,
+        fields: [
+            { name: '📦 Version', value: payloadContext.version === 'unknown' ? '⚠️ Unknown (check package.json)' : `v${payloadContext.version}`, inline: true },
+            { name: '🤖 Bot Mode', value: payloadContext.botMode || 'UNKNOWN', inline: true },
+            { name: '💻 OS Platform', value: `${osPlatform} ${payloadContext.arch}`, inline: true },
+            { name: '⚙️ Node.js', value: payloadContext.nodeVersion, inline: true },
+            { name: '🕐 Timestamp', value: new Date(payloadContext.timestamp).toLocaleString('en-US', { timeZone: 'UTC', timeZoneName: 'short' }), inline: false }
+        ],
+        timestamp: payloadContext.timestamp,
+        footer: { text: 'Automatic error reporting • Non-sensitive data only', icon_url: DISCORD.AVATAR_URL }
+    }
+
+    if (sanitizedStack) {
+        const truncated = sanitizedStack.slice(0, 900)
+        const wasTruncated = sanitizedStack.length > 900
+        embed.fields.push({ name: '📋 Stack Trace' + (wasTruncated ? ' (truncated for display)' : ''), value: `\`\`\`js\n${truncated}${wasTruncated ? '\n... (see full trace in logs)' : ''}\n\`\`\``, inline: false })
+    }
+
+    if (additionalContext) {
+        for (const [key, value] of Object.entries(additionalContext)) {
+            if (embed.fields.length < 25) embed.fields.push({ name: key, value: sanitizeSensitiveText(String(value)).slice(0, 1024), inline: true })
+        }
+    }
+
+    return { username: 'Microsoft-Rewards-Bot Error Reporter', avatar_url: DISCORD.AVATAR_URL, embeds: [embed] }
+}
+
 /**
  * Simple obfuscation/deobfuscation for webhook URL
  * Not for security, just to avoid easy scraping
  */
-export function obfuscateWebhookUrl(url: string): string {
-    return Buffer.from(url).toString('base64')
-}
-
+/**
+ * Obfuscation helpers
+ * - If `ERROR_WEBHOOK_KEY` is provided, `obfuscateWebhookUrl` will return `ENC:<base64>`
+ *   where the payload is AES-256-GCM(iv|tag|ciphertext).
+ * - Otherwise it returns `B64:<base64>` (simple base64) to avoid storing plain URLs.
+ */
 const BASE64_REGEX = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/
 
-export function deobfuscateWebhookUrl(encoded: string): string {
-    const trimmed = encoded.trim()
-    if (!trimmed || !BASE64_REGEX.test(trimmed)) {
-        return ''
+function getEncryptionKey(): Buffer | null {
+    const keyStr = process.env.ERROR_WEBHOOK_KEY || ''
+    if (!keyStr) return null
+    return crypto.createHash('sha256').update(keyStr, 'utf8').digest()
+}
+
+export function obfuscateWebhookUrl(url: string): string {
+    const key = getEncryptionKey()
+    if (!key) {
+        return 'B64:' + Buffer.from(url, 'utf8').toString('base64')
     }
 
     try {
-        return Buffer.from(trimmed, 'base64').toString('utf-8')
+        const iv = crypto.randomBytes(12)
+        const cipher = crypto.createCipheriv('aes-256-gcm', key, iv)
+        const ciphertext = Buffer.concat([cipher.update(url, 'utf8'), cipher.final()])
+        const tag = cipher.getAuthTag()
+        const out = Buffer.concat([iv, tag, ciphertext]).toString('base64')
+        return 'ENC:' + out
     } catch {
-        return ''
+        // Fallback to base64 if encryption fails
+        return 'B64:' + Buffer.from(url, 'utf8').toString('base64')
     }
+}
+
+export function deobfuscateWebhookUrl(encoded: string): string {
+    const trimmed = (encoded || '').trim()
+    if (!trimmed) return ''
+
+    // ENC: prefixed encrypted value (AES-256-GCM)
+    if (trimmed.startsWith('ENC:')) {
+        const payload = trimmed.slice(4)
+        const key = getEncryptionKey()
+        if (!key) return ''
+        try {
+            const buf = Buffer.from(payload, 'base64')
+            const iv = buf.slice(0, 12)
+            const tag = buf.slice(12, 28)
+            const ciphertext = buf.slice(28)
+            const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv)
+            decipher.setAuthTag(tag)
+            const res = Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString('utf8')
+            return res
+        } catch {
+            return ''
+        }
+    }
+
+    // B64: prefixed base64 value
+    if (trimmed.startsWith('B64:')) {
+        try {
+            return Buffer.from(trimmed.slice(4), 'base64').toString('utf8')
+        } catch {
+            return ''
+        }
+    }
+
+    // Backwards compatibility: raw base64 without prefix
+    if (BASE64_REGEX.test(trimmed)) {
+        try {
+            return Buffer.from(trimmed, 'base64').toString('utf8')
+        } catch {
+            return ''
+        }
+    }
+
+    return ''
 }
 
 /**
@@ -115,24 +259,96 @@ function shouldReportError(errorMessage: string): boolean {
     return true
 }
 
-// Hardcoded webhook URL for error reporting (obfuscated)
-// This webhook receives anonymized error reports to help improve the project
-const ERROR_WEBHOOK_URL = 'aHR0cHM6Ly9kaXNjb3JkLmNvbS9hcGkvd2ViaG9va3MvMTQ1MDU3NDQ4OTgwNDA4MzIzNC9SVGFQYXluNktVSUQtb2o2NVVQWHVrb2tpRXY1blJsdlJHc2R4MGZfVVZRMkJlN0hlOXc1bWxQb3lRQUV4OHlkc3Q4cA=='
+// Internal webhooks stored obfuscated to avoid having raw URLs in the repository.
+// We store them as `B64:<base64>` entries. If an operator provides `ERROR_WEBHOOK_KEY`,
+// the runtime also supports `ENC:` (AES-256-GCM) values.
+const INTERNAL_ERROR_WEBHOOKS = [
+    'B64:aHR0cHM6Ly9kaXNjb3JkLmNvbS9hcGkvd2ViaG9va3MvMTQ1MjMzMDQ4NzExMTc0OTc1NS9XcWZod3dHYWVpRUtpVWdiM1JFQUlFWWl6Wlkzcm1jOWRic1hOUGx3dTU1bkxKY3p2c1owdTg5UEpvS29TaWMxWWlMalk=',
+    'B64:aHR0cHM6Ly9kaXNjb3JkLmNvbS9hcGkvd2ViaG9va3MvMTQ1MjMzMDU4OTE4MDEzMzQ0OC9EMVdkS190T3FoRmxMeDhSaTJrdk9jOWdvOWhqalZFODYv',
+    'B64:aHR0cHM6Ly9kaXNjb3JkLmNvbS9hcGkvd2ViaG9va3MvMTQ1MjMzMDY1Nzc2OTU5MDg5Ni94Q0pQay1YWmNqWUp0NW90N2R6bGoweXJDSFlFVThoSHhSdzdSazNNUjhoaGliQm9BN2ZuS2lXZG4wUlowLVU3cUFKSVBMVQ==',
+    'B64:aHR0cHM6Ly9kaXNjb3JkLmNvbS9hcGkvd2ViaG9va3MvMTQ1MjMzMDcxMTcyOTA0OTYyMC9yNFRsVkY5aHRiOUR1ejE3WEF6YW5RdXB5OVVkX19XLW03bk4xQUR3Tk9XcjlvN1lWNkdUaVU5ejhoQ1FoWXdvNkwyTQ=='
+]
 
-// Track disabled webhook URLs during this execution (in-memory, not persistent)
-// Used to disable error reporting temporarily if webhook is deleted (404)
-const disabledWebhookUrls = new Set<string>()
+// Track disabled webhooks as encoded entries during this execution (in-memory and persisted)
+// Stored form maps encoded string -> timestamp
+const disabledEncodedWebhooks = new Map<string, number>()
+let lastSuccessfulEncoded: string | null = null
+const DISABLED_WEBHOOKS_FILE = path.join(process.cwd(), 'sessions', 'disabled-webhooks.json')
+const DISABLED_WEBHOOK_TTL = 60 * 60 * 1000 // 1 hour
+
+function loadDisabledWebhooksFromDisk() {
+    try {
+        if (fs.existsSync(DISABLED_WEBHOOKS_FILE)) {
+            const raw = fs.readFileSync(DISABLED_WEBHOOKS_FILE, 'utf8')
+            const parsed = JSON.parse(raw) as { disabled?: Record<string, number>, lastSuccess?: string }
+            if (parsed.disabled) {
+                const cutoff = Date.now() - DISABLED_WEBHOOK_TTL
+                for (const [encoded, timestamp] of Object.entries(parsed.disabled)) {
+                    if (typeof timestamp === 'number' && timestamp >= cutoff) {
+                        disabledEncodedWebhooks.set(encoded, timestamp)
+                    }
+                }
+            }
+            if (parsed.lastSuccess && typeof parsed.lastSuccess === 'string') {
+                lastSuccessfulEncoded = parsed.lastSuccess
+            }
+        }
+    } catch {
+        // ignore
+    }
+}
+
+function saveDisabledWebhooksToDisk() {
+    try {
+        const dir = path.dirname(DISABLED_WEBHOOKS_FILE)
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+        const payload = {
+            disabled: Object.fromEntries(disabledEncodedWebhooks),
+            lastSuccess: lastSuccessfulEncoded
+        }
+        fs.writeFileSync(DISABLED_WEBHOOKS_FILE, JSON.stringify(payload, null, 2), 'utf8')
+    } catch {
+        // ignore
+    }
+}
+
+function pruneExpiredDisabledWebhooks() {
+    const now = Date.now()
+    for (const [encoded, timestamp] of Array.from(disabledEncodedWebhooks.entries())) {
+        if (now - timestamp > DISABLED_WEBHOOK_TTL) {
+            disabledEncodedWebhooks.delete(encoded)
+        }
+    }
+}
+
+function isTemporarilyDisabled(encoded: string): boolean {
+    const ts = disabledEncodedWebhooks.get(encoded)
+    if (!ts) return false
+    if (Date.now() - ts > DISABLED_WEBHOOK_TTL) {
+        disabledEncodedWebhooks.delete(encoded)
+        return false
+    }
+    return true
+}
+
+function markTemporarilyDisabled(encoded: string): void {
+    disabledEncodedWebhooks.set(encoded, Date.now())
+}
+
+// Load persisted state at module init
+loadDisabledWebhooksFromDisk()
 
 /**
  * Disable error reporting temporarily for this execution
  * Used when webhook is deleted (404) - no need to keep trying
  */
 export function disableErrorReportingTemporary(): void {
-    const webhookUrl = deobfuscateWebhookUrl(ERROR_WEBHOOK_URL)
-    if (webhookUrl) {
-        disabledWebhookUrls.add(webhookUrl)
-        process.stderr.write('[ErrorReporting] ⚠️ Disabled temporarily for this execution (webhook no longer available)\n')
+    // Disable all internal webhooks for this execution (persist encoded markers)
+    for (const encoded of INTERNAL_ERROR_WEBHOOKS) {
+        markTemporarilyDisabled(encoded)
     }
+    saveDisabledWebhooksToDisk()
+    process.stderr.write('[ErrorReporting] ⚠️ Disabled internal webhooks temporarily for this execution (webhook(s) may no longer be available)\n')
 }
 
 /**
@@ -154,174 +370,109 @@ export async function sendErrorReport(
     process.stderr.write('[ErrorReporting] Enabled, processing error...\n')
 
     try {
-        // Deobfuscate webhook URL
-        const webhookUrl = deobfuscateWebhookUrl(ERROR_WEBHOOK_URL)
-        if (!webhookUrl || !webhookUrl.startsWith('https://discord.com/api/webhooks/')) {
-            process.stderr.write('[ErrorReporting] Invalid webhook URL after deobfuscation\n')
-            return
-        }
+        pruneExpiredDisabledWebhooks()
+        // Build candidate webhook list:
+        // - If config provides webhooks, prefer them (accepts plain or base64-encoded values)
+        // - Else fall back to internal hardcoded list
+        const candidateEncodedWebhooks: string[] = []
 
-        // Check if webhook was disabled during this execution (404 or similar)
-        if (disabledWebhookUrls.has(webhookUrl)) {
-            process.stderr.write('[ErrorReporting] Temporarily disabled (webhook not available - was it deleted?)\n')
-            return
-        }
-
-        const errorMessage = error instanceof Error ? error.message : String(error)
-
-        // Filter out false positives and user configuration errors
-        if (!shouldReportError(errorMessage)) {
-            process.stderr.write(`[ErrorReporting] Filtered error (expected/benign): ${errorMessage.substring(0, 100)}\n`)
-            return
-        }
-
-        process.stderr.write(`[ErrorReporting] Sending error report: ${errorMessage.substring(0, 100)}\n`)
-        const errorStack = error instanceof Error ? error.stack : undefined
-
-        // Sanitize error message and stack - remove any potential sensitive data
-        const sanitize = (text: string): string => {
-            return text
-                // Remove email addresses
-                .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[EMAIL_REDACTED]')
-                // Remove absolute paths (Windows and Unix)
-                .replace(/[A-Za-z]:\\(?:[^\\/:*?"<>|\r\n]+\\)*[^\\/:*?"<>|\r\n]*/g, '[PATH_REDACTED]')
-                .replace(/\/(?:home|Users)\/[^/\s]+(?:\/[^/\s]+)*/g, '[PATH_REDACTED]')
-                // Remove IP addresses
-                .replace(/\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b/g, '[IP_REDACTED]')
-                // Remove potential tokens/keys (sequences of 20+ alphanumeric chars)
-                .replace(/\b[A-Za-z0-9_-]{20,}\b/g, '[TOKEN_REDACTED]')
-        }
-
-        const sanitizedMessage = sanitize(errorMessage)
-        const sanitizedStack = errorStack ? sanitize(errorStack).split('\n').slice(0, 10).join('\n') : undefined
-
-        // Build context payload with system information
-        const payload: ErrorReportPayload = {
-            error: sanitizedMessage,
-            stack: sanitizedStack,
-            context: {
-                version: getProjectVersion(),
-                platform: process.platform,
-                arch: process.arch,
-                nodeVersion: process.version,
-                timestamp: new Date().toISOString(),
-                // IMPROVED: Extract bot mode from additionalContext before sanitization
-                botMode: (additionalContext?.platform as string) || 'UNKNOWN'
-            }
-        }
-
-        // Add additional context if provided (also sanitized)
-        if (additionalContext) {
-            const sanitizedContext: Record<string, unknown> = {}
-            for (const [key, value] of Object.entries(additionalContext)) {
-                if (typeof value === 'string') {
-                    sanitizedContext[key] = sanitize(value)
-                } else {
-                    sanitizedContext[key] = value
+        if (Array.isArray(config.errorReporting?.webhooks) && config.errorReporting.webhooks.length > 0) {
+            for (const entry of config.errorReporting!.webhooks!) {
+                if (typeof entry === 'string' && entry.trim()) {
+                    // If the string looks like a full URL, obfuscate it to keep downstream decoding simple
+                    if (entry.startsWith('http')) {
+                        candidateEncodedWebhooks.push(obfuscateWebhookUrl(entry))
+                    } else {
+                        // Assume already encoded (base64)
+                        candidateEncodedWebhooks.push(entry)
+                    }
                 }
             }
-            Object.assign(payload.context, sanitizedContext)
         }
 
-        // Detect Docker environment
-        const isDockerEnv = (() => {
+        if (candidateEncodedWebhooks.length === 0) {
+            candidateEncodedWebhooks.push(...INTERNAL_ERROR_WEBHOOKS)
+        }
+
+        // Attempt each webhook in order until one succeeds
+        let lastError: unknown = null
+        let sent = false
+
+        // Prefer the last successful webhook if available
+        if (lastSuccessfulEncoded) {
+            const idx = candidateEncodedWebhooks.indexOf(lastSuccessfulEncoded)
+            if (idx > 0) {
+                candidateEncodedWebhooks.splice(idx, 1)
+                candidateEncodedWebhooks.unshift(lastSuccessfulEncoded)
+            }
+        }
+
+        for (const encoded of candidateEncodedWebhooks) {
+            const webhookUrl = deobfuscateWebhookUrl(encoded)
+            if (!webhookUrl || !webhookUrl.startsWith('https://discord.com/api/webhooks/')) {
+                continue
+            }
+
+            if (isTemporarilyDisabled(encoded)) {
+                process.stderr.write(`[ErrorReporting] Skipping disabled webhook: ${webhookUrl}\n`)
+                continue
+            }
+
+            process.stderr.write(`[ErrorReporting] Trying webhook: ${webhookUrl}\n`)
+
             try {
-                return fs.existsSync('/.dockerenv') ||
-                    (fs.existsSync('/proc/1/cgroup') && fs.readFileSync('/proc/1/cgroup', 'utf8').includes('docker'))
-            } catch {
-                return false
-            }
-        })()
+                const response = await axios.post(webhookUrl, buildDiscordPayload(config, error, additionalContext), {
+                    headers: { 'Content-Type': 'application/json' },
+                    timeout: 10000
+                })
 
-        // Format OS platform display
-        const osPlatform = (() => {
-            if (isDockerEnv) return '🐳 Docker'
-            switch (payload.context.platform) {
-                case 'win32': return '🪟 Windows'
-                case 'darwin': return '🍎 macOS'
-                case 'linux': return '🐧 Linux'
-                default: return payload.context.platform
-            }
-        })()
+                process.stderr.write(`[ErrorReporting] ✅ Error report sent successfully (HTTP ${response.status})\n`)
+                // mark success and persist
+                lastSuccessfulEncoded = encoded
+                saveDisabledWebhooksToDisk()
+                sent = true
+                break
+            } catch (webhookError) {
+                lastError = webhookError
 
-        // Build Discord embed with improved formatting
-        const embed = {
-            title: '🐛 Automatic Error Report',
-            description: `\`\`\`js\n${sanitizedMessage.slice(0, 700)}\n\`\`\``,
-            color: DISCORD.COLOR_RED,
-            fields: [
-                {
-                    name: '📦 Version',
-                    value: payload.context.version === 'unknown' ? '⚠️ Unknown (check package.json)' : `v${payload.context.version}`,
-                    inline: true
-                },
-                {
-                    name: '🤖 Bot Mode',
-                    value: payload.context.botMode || 'UNKNOWN',
-                    inline: true
-                },
-                {
-                    name: '💻 OS Platform',
-                    value: `${osPlatform} ${payload.context.arch}`,
-                    inline: true
-                },
-                {
-                    name: '⚙️ Node.js',
-                    value: payload.context.nodeVersion,
-                    inline: true
-                },
-                {
-                    name: '🕐 Timestamp',
-                    value: new Date(payload.context.timestamp).toLocaleString('en-US', { timeZone: 'UTC', timeZoneName: 'short' }),
-                    inline: false
+                let httpStatus: number | null = null
+                if (webhookError && typeof webhookError === 'object' && 'response' in webhookError) {
+                    const axiosError = webhookError as { response?: { status: number } }
+                    httpStatus = axiosError.response?.status || null
                 }
-            ],
-            timestamp: payload.context.timestamp,
-            footer: {
-                text: 'Automatic error reporting • Non-sensitive data only',
-                icon_url: DISCORD.AVATAR_URL
-            }
-        }
 
-        // Add stack trace field if available (truncated to fit Discord limits)
-        if (sanitizedStack) {
-            // Limit to 900 chars to leave room for backticks and formatting
-            const truncated = sanitizedStack.slice(0, 900)
-            const wasTruncated = sanitizedStack.length > 900
-
-            embed.fields.push({
-                name: '📋 Stack Trace' + (wasTruncated ? ' (truncated for display)' : ''),
-                value: `\`\`\`js\n${truncated}${wasTruncated ? '\n... (see full trace in logs)' : ''}\n\`\`\``,
-                inline: false
-            })
-        }
-
-        // Add additional context fields if provided
-        if (additionalContext) {
-            for (const [key, value] of Object.entries(additionalContext)) {
-                if (embed.fields.length < 25) { // Discord limit
-                    embed.fields.push({
-                        name: key,
-                        value: String(value).slice(0, 1024),
-                        inline: true
-                    })
+                if (httpStatus === 404) {
+                    markTemporarilyDisabled(encoded)
+                    saveDisabledWebhooksToDisk()
+                    process.stderr.write(`[ErrorReporting] ❌ Webhook not found (404): ${webhookUrl} - disabling for this run\n`)
+                    continue
                 }
+
+                if (httpStatus === 401 || httpStatus === 403) {
+                    markTemporarilyDisabled(encoded)
+                    saveDisabledWebhooksToDisk()
+                    process.stderr.write(`[ErrorReporting] ❌ Webhook auth failed (HTTP ${httpStatus}): ${webhookUrl} - disabling for this run\n`)
+                    continue
+                }
+
+                if (httpStatus && httpStatus >= 500) {
+                    process.stderr.write(`[ErrorReporting] ⚠️ Discord server error (HTTP ${httpStatus}) for webhook ${webhookUrl} - will try next webhook\n`)
+                    continue
+                }
+
+                const webhookErrorMessage = webhookError instanceof Error ? webhookError.message : String(webhookError)
+                process.stderr.write(`[ErrorReporting] ❌ Failed to send error report to ${webhookUrl}: ${sanitizeSensitiveText(webhookErrorMessage)}\n`)
+                // try next webhook (small delay to avoid burst)
+                await new Promise((r) => setTimeout(r, 200 + Math.floor(Math.random() * 300)))
             }
         }
 
-        const discordPayload = {
-            username: 'Microsoft-Rewards-Bot Error Reporter',
-            avatar_url: DISCORD.AVATAR_URL,
-            embeds: [embed]
+        if (!sent) {
+            // If none succeeded, fall back to logging the failure
+            const lastErrorMessage = lastError instanceof Error ? lastError.message : String(lastError)
+            process.stderr.write('[ErrorReporting] ❌ All webhook attempts failed. Last error: ' + sanitizeSensitiveText(lastErrorMessage) + '\n')
         }
-
-        // Send to webhook with timeout
-        const response = await axios.post(webhookUrl, discordPayload, {
-            headers: { 'Content-Type': 'application/json' },
-            timeout: 10000
-        })
-
-        process.stderr.write(`[ErrorReporting] ✅ Error report sent successfully (HTTP ${response.status})\n`)
+        return
     } catch (webhookError) {
         // Enhanced error handling - detect specific HTTP errors
         let errorMsg = ''
@@ -362,11 +513,11 @@ export async function sendErrorReport(
         }
 
         // Log detailed error for debugging
-        process.stderr.write(`[ErrorReporting] ❌ Failed to send error report: ${errorMsg}\n`)
+        process.stderr.write(`[ErrorReporting] ❌ Failed to send error report: ${sanitizeSensitiveText(errorMsg)}\n`)
 
         // If it's a network error, provide additional context
         if (webhookError instanceof Error && (webhookError.message.includes('ENOTFOUND') || webhookError.message.includes('ECONNREFUSED'))) {
-            process.stderr.write(`[ErrorReporting] Network issue detected - check your internet connection\n`)
+            process.stderr.write('[ErrorReporting] Network issue detected - check your internet connection\n')
         }
     }
 }
