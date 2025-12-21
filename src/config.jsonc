@@ -134,7 +134,7 @@
     },
     // === DASHBOARD ===
     "dashboard": {
-        "enabled": false, // autostart the dashboard with the bot
+        "enabled": true, // autostart the dashboard with the bot
         "port": 3000,
         "host": "127.0.0.1"
     },
