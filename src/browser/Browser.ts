@@ -94,24 +94,39 @@ class Browser {
                 '--no-first-run',
                 '--no-default-browser-check',
                 '--no-zygote',
-                '--single-process',
                 // ANTI-DETECTION: Make WebDriver undetectable
                 '--enable-features=NetworkService,NetworkServiceInProcess'
             ]
 
-            // Linux stability fixes
-            const linuxStabilityArgs = isLinux ? [
+            // Platform-specific stability fixes
+            // CRITICAL: --single-process is unstable on Windows and causes context closure
+            const platformStabilityArgs = isLinux ? [
+                '--single-process', // Safe on Linux with proper memory management
                 '--disable-dev-shm-usage',
                 '--disable-software-rasterizer',
                 '--disable-http-cache',
                 '--disk-cache-size=1'
-            ] : []
+            ] : [
+                // Windows-specific stability (avoid --single-process which crashes Chromium context)
+                '--disable-background-networking',
+                '--disable-preconnect',
+                '--disable-web-resources',
+                '--disable-component-extensions-with-background-pages',
+                '--disable-translate',
+                '--disable-sync-on-cellular',
+                '--disable-device-discovery-notifications',
+                '--disable-default-language',
+                '--disable-print-preview'
+            ]
+
+            // CRITICAL: Windows needs longer timeout (120s) due to slower context initialization
+            const launchTimeout = isLinux ? 90000 : 120000
 
             browser = await playwright.chromium.launch({
                 headless,
                 ...(proxyConfig && { proxy: proxyConfig }),
-                args: [...baseArgs, ...linuxStabilityArgs],
-                timeout: isLinux ? 90000 : 60000
+                args: [...baseArgs, ...platformStabilityArgs],
+                timeout: launchTimeout
             })
         } catch (e: unknown) {
             const msg = (e instanceof Error ? e.message : String(e))

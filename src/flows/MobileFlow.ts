@@ -59,7 +59,7 @@ export class MobileFlow {
         this.bot.log(true, 'MOBILE-FLOW', 'Starting mobile automation flow')
 
         // IMPROVED: Use centralized browser factory to eliminate duplication
-        const browser = await createBrowserInstance(this.bot, account.proxy, account.email)
+        let browser = await createBrowserInstance(this.bot, account.proxy, account.email)
 
         let keepBrowserOpen = false
         let browserClosed = false
@@ -70,7 +70,23 @@ export class MobileFlow {
             this.bot.log(true, 'MOBILE-FLOW', 'Browser started successfully')
 
             // Login into MS Rewards, then respect compromised mode
-            await this.bot.login.login(this.bot.homePage, account.email, account.password, account.totp)
+            try {
+                await this.bot.login.login(this.bot.homePage, account.email, account.password, account.totp)
+            } catch (loginErr) {
+                const msg = loginErr instanceof Error ? loginErr.message : String(loginErr)
+                if (msg.includes('Target page, context or browser has been closed')) {
+                    this.bot.log(true, 'MOBILE-FLOW', 'Browser/context closed during login. Attempting one retry with a fresh browser context', 'warn')
+                    // Ensure previous browser/context is closed gracefully
+                    await closeBrowserSafely(this.bot, browser, account.email, true)
+
+                    // Create a fresh browser context and retry login once
+                    browser = await createBrowserInstance(this.bot, account.proxy, account.email)
+                    this.bot.homePage = await browser.newPage()
+                    await this.bot.login.login(this.bot.homePage, account.email, account.password, account.totp)
+                } else {
+                    throw loginErr
+                }
+            }
 
             if (this.bot.compromisedModeActive) {
                 const reason = this.bot.compromisedReason || 'security-issue'

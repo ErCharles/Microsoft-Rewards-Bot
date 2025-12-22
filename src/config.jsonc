@@ -88,7 +88,7 @@
     },
     // === BROWSER ===
     "browser": {
-        "headless": false,
+        "headless": true,
         "globalTimeout": "30s"
     },
     "fingerprinting": {
