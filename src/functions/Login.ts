@@ -228,10 +228,6 @@ export class Login {
 
             await this.disableFido(page)
 
-            // CRITICAL: Setup dialog handlers BEFORE any login interactions
-            // This prevents native browser dialogs (Bluetooth, Windows Hello, Passkey) from blocking automation
-            this.passkeyHandler.setupDialogHandlers(page)
-
             const [reloadResult, totpResult, portalCheck] = await Promise.allSettled([
                 this.bot.browser.utils.reloadBadPage(page),
                 this.totpHandler.tryAutoTotp(page, 'initial landing'),

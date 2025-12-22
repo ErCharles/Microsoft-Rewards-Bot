@@ -182,6 +182,32 @@ class Browser {
         try {
             context.on('page', async (page) => {
                 try {
+                    // CRITICAL: Install dialog handlers FIRST to prevent Bluetooth/Passkey native popups
+                    page.removeAllListeners('dialog')
+                    page.on('dialog', async (dialog) => {
+                        const message = dialog.message()
+                        const type = dialog.type()
+
+                        this.bot.log(
+                            this.bot.isMobile,
+                            'BROWSER-DIALOG',
+                            `Native dialog: [${type}] "${message.substring(0, 50)}"`,
+                            'warn'
+                        )
+
+                        try {
+                            if (type === 'beforeunload') {
+                                await dialog.accept()
+                            } else {
+                                // Dismiss all other dialogs (Bluetooth, Passkey, Windows Hello)
+                                await dialog.dismiss()
+                                this.bot.log(this.bot.isMobile, 'BROWSER-DIALOG', `Dismissed ${type} dialog`, 'log', 'green')
+                            }
+                        } catch (e) {
+                            this.bot.log(this.bot.isMobile, 'BROWSER-DIALOG', `Dialog error: ${e instanceof Error ? e.message : String(e)}`, 'error')
+                        }
+                    })
+
                     // CRITICAL: Inject anti-detection scripts BEFORE any page load
                     await page.addInitScript(antiDetectScript)
                     await page.addInitScript(timezoneScript)
