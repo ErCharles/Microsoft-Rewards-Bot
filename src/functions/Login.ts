@@ -46,6 +46,7 @@ const DEFAULT_TIMEOUTS = {
     rewardsPortalCheck: 8000,
     navigationTimeout: 30000,
     navigationTimeoutLinux: 60000,
+    navigationTimeoutWindows: 90000, // Windows is slower at initializing contexts (issue: context closure)
     bingVerificationMaxIterations: 10,
     bingVerificationMaxIterationsMobile: 8
 } as const
@@ -121,7 +122,11 @@ export class Login {
         maxAttempts = 3
     ): Promise<{ success: boolean; recoveryUsed: boolean }> {
         const isLinux = process.platform === 'linux'
-        const navigationTimeout = isLinux ? DEFAULT_TIMEOUTS.navigationTimeoutLinux : DEFAULT_TIMEOUTS.navigationTimeout
+        const isWindows = process.platform === 'win32'
+        // CRITICAL FIX: Windows needs 90s timeout to avoid "Target page, context or browser has been closed"
+        const navigationTimeout = isWindows ? DEFAULT_TIMEOUTS.navigationTimeoutWindows : 
+                                  isLinux ? DEFAULT_TIMEOUTS.navigationTimeoutLinux : 
+                                  DEFAULT_TIMEOUTS.navigationTimeout
 
         let navigationSucceeded = false
         let recoveryUsed = false
