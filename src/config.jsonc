@@ -136,7 +136,7 @@
     "dashboard": {
         "enabled": true, // autostart the dashboard with the bot
         "port": 3000,
-        "host": "127.0.0.1"
+        "host": "0.0.0.0"
     },
     // === SCHEDULING ===
     // Automatic daily execution at specified time
