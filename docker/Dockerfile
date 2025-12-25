@@ -82,10 +82,16 @@ COPY --from=builder /usr/src/microsoft-rewards-bot/node_modules ./node_modules
 # Copy runtime scripts with proper permissions and normalize line endings for non-Unix users
 # IMPROVED: Scripts now organized in docker/ folder
 COPY --chmod=755 docker/run_daily.sh ./docker/run_daily.sh
+# --- LÍNEA NUEVA AÑADIDA ABAJO ---
+COPY --chmod=755 docker/start_render.sh ./docker/start_render.sh
+# ---------------------------------
 COPY --chmod=644 docker/crontab.template /etc/cron.d/microsoft-rewards-cron.template
 COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+
+# Añadimos start_render.sh a la limpieza de caracteres por si acaso
 RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh \
-    && sed -i 's/\r$//' ./docker/run_daily.sh
+    && sed -i 's/\r$//' ./docker/run_daily.sh \
+    && sed -i 's/\r$//' ./docker/start_render.sh
 
 # Entrypoint handles TZ, initial run toggle, cron templating & launch
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
